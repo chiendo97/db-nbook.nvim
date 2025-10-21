@@ -1,0 +1,418 @@
+--[[
+Database Notebook - Interactive Database Query Interface in Markdown Format
+
+This example demonstrates:
+- Single-buffer markdown-based interface
+- Editable code blocks for connection settings and queries
+- Multiple query support with individual execution
+- Saveable to local filesystem
+- Text change detection and parsing
+
+To run this example:
+1. Open this file in Neovim
+2. Execute: :luafile %
+3. A markdown buffer will open with three sections
+4. Edit the bash block for connection settings
+5. Edit the sql block for your query
+6. Press <CR> on [Execute] to run a query
+7. Save the file with :w to preserve your queries
+
+Database URI formats:
+- SQLite: sqlite://path/to/database.db or sqlite://:memory:
+- ClickHouse: clickhouse://user:password@host:port/database
+- PostgreSQL: postgresql://user:password@host:port/database
+- Redis: redis://password@host:port/db
+--]]
+
+local Morph = require("morph")
+local h = Morph.h
+
+--------------------------------------------------------------------------------
+-- Utility Functions
+--------------------------------------------------------------------------------
+
+-- Utility function to parse database type from URI
+--- @param uri string
+--- @return 'sqlite'|'clickhouse'|'postgresql'|'redis'|nil
+local function detect_db_type(uri)
+	if uri:match("^sqlite://") then
+		return "sqlite"
+	elseif uri:match("^clickhouse://") then
+		return "clickhouse"
+	elseif uri:match("^postgres") then
+		return "postgresql"
+	elseif uri:match("^redis://") then
+		return "redis"
+	end
+	return nil
+end
+
+-- Execute database query based on DB type
+--- @param db_type 'sqlite'|'clickhouse'|'postgresql'|'redis'
+--- @param uri string
+--- @param query string
+--- @param callback fun(success: boolean, result: string)
+local function on_execute(db_type, uri, query, callback)
+	local cmd
+
+	if db_type == "sqlite" then
+		-- Parse SQLite URI: sqlite://path/to/db.db or sqlite://:memory:
+		local db_path = uri:match("sqlite://(.+)")
+		if not db_path then
+			callback(false, "Invalid SQLite URI format")
+			return
+		end
+
+		-- Use sqlite3 command with JSON output mode
+		-- -json: Output results as JSON array
+		cmd = string.format("sqlite3 -json %s %s", vim.fn.shellescape(db_path), vim.fn.shellescape(query))
+	elseif db_type == "clickhouse" then
+		-- Parse ClickHouse URI: clickhouse://user:password@host:port/database
+		local user, password, host, port, database = uri:match("clickhouse://([^:]+):([^@]+)@([^:]+):(%d+)/(.+)")
+		if not user then
+			callback(false, "Invalid ClickHouse URI format")
+			return
+		end
+
+		-- Use clickhouse-client command
+		cmd = string.format(
+			"clickhouse-client --host=%s --port=%s --user=%s --password=%s --database=%s --query=%s --format=JSONEachRow",
+			vim.fn.shellescape(host),
+			vim.fn.shellescape(port),
+			vim.fn.shellescape(user),
+			vim.fn.shellescape(password),
+			vim.fn.shellescape(database),
+			vim.fn.shellescape(query)
+		)
+	elseif db_type == "postgresql" then
+		-- Use psql command with connection string and JSON output
+		cmd = string.format("psql %s -c %s --tuples-only --json", vim.fn.shellescape(uri), vim.fn.shellescape(query))
+	elseif db_type == "redis" then
+		-- Parse Redis URI: redis://password@host:port/db
+		local password, host, port, db = uri:match("redis://([^@]+)@([^:]+):(%d+)/(%d+)")
+		if not password then
+			-- Try without password: redis://host:port/db
+			host, port, db = uri:match("redis://([^:]+):(%d+)/(%d+)")
+			if not host then
+				callback(false, "Invalid Redis URI format")
+				return
+			end
+			cmd = string.format(
+				"redis-cli -h %s -p %s -n %s %s",
+				vim.fn.shellescape(host),
+				vim.fn.shellescape(port),
+				vim.fn.shellescape(db),
+				vim.fn.shellescape(query)
+			)
+		else
+			cmd = string.format(
+				"redis-cli -h %s -p %s -a %s -n %s %s",
+				vim.fn.shellescape(host),
+				vim.fn.shellescape(port),
+				vim.fn.shellescape(password),
+				vim.fn.shellescape(db),
+				vim.fn.shellescape(query)
+			)
+		end
+	else
+		callback(false, "Unsupported database type")
+		return
+	end
+
+	vim.notify("Executing command: " .. cmd, vim.log.levels.INFO, { title = "Database Notebook" })
+
+	-- Execute command asynchronously
+	vim.fn.jobstart(cmd, {
+		stdout_buffered = true,
+		stderr_buffered = true,
+		on_stdout = function(_, data)
+			if data then
+				local result = table.concat(data, "\n")
+				callback(true, result)
+			end
+		end,
+		on_stderr = function(_, data)
+			if data and #data > 0 then
+				local error = table.concat(data, "\n")
+				if error ~= "" then
+					callback(false, "Error: " .. error)
+				end
+			end
+		end,
+		on_exit = function(_, exit_code)
+			-- if exit_code ~= 0 then callback(false, 'Query failed with exit code: ' .. exit_code) end
+		end,
+	})
+end
+
+--------------------------------------------------------------------------------
+-- Query Block Component
+--------------------------------------------------------------------------------
+
+-- Represents a single executable query block
+--- @param ctx morph.Ctx<{ query_id: integer, query_text: string, on_execute: function }, { status: 'idle'|'running'|'success'|'error', result: string }>
+local function QueryBlock(ctx)
+	if ctx.phase == "mount" then
+		ctx.state = {
+			status = "idle",
+			result = "",
+		}
+	end
+
+	local state = assert(ctx.state)
+	local props = ctx.props
+
+	return {
+		"\n",
+		h.Title({}, "### Query " .. props.query_id),
+		"\n\n",
+
+		-- SQL Code Block
+		h.Comment({}, "```sql"),
+		"\n",
+		h("text", {
+			id = "query-" .. props.query_id,
+			on_change = function(e)
+				props.on_execute(props.query_id, e.text)
+			end,
+			nmap = {
+				["<CR>"] = function()
+					ctx:update({ status = "running", result = "Executing query..." })
+					props.on_execute(props.query_id, props.query_text, function(success, result)
+						vim.schedule(function()
+							ctx:update({
+								status = success and "success" or "error",
+								result = result,
+							})
+						end)
+					end)
+					return ""
+				end,
+			},
+		}, props.query_text),
+		"\n",
+		h.Comment({}, "```"),
+		"\n\n",
+
+		-- Status
+		h.Title({}, "Status: "),
+		state.status == "running" and h.WarningMsg({}, "Running...") or state.status == "success" and h.String(
+			{},
+			"Success"
+		) or state.status == "error" and h.ErrorMsg({}, "Error") or h.Comment({}, "Idle"),
+		"\n\n",
+
+		-- Results Code Block
+		state.result ~= ""
+				and {
+					h.Title({}, "Results:"),
+					"\n\n",
+					h("text", {}, "```json"),
+					"\n",
+					h("text", {}, state.result),
+					"\n",
+					h("text", {}, "```"),
+					"\n",
+				}
+			or "",
+	}
+end
+
+--------------------------------------------------------------------------------
+-- Main App Component
+--------------------------------------------------------------------------------
+
+--- @param ctx morph.Ctx<{}, { connection_uri: string, db_type: string|nil, queries: table<integer, string>, query_states: table<integer, any> }>
+local function DatabaseNotebook(ctx)
+	if ctx.phase == "mount" then
+		ctx.state = {
+			connection_uri = "sqlite:///tmp/foo.db",
+			db_type = detect_db_type("sqlite://:memory:"),
+			queries = {
+				[1] = [[CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);
+INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');
+INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com');
+INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@example.com');]],
+				[2] = "SELECT * FROM users;",
+				[3] = "SELECT sqlite_version();",
+			},
+			query_states = {},
+		}
+	end
+
+	local state = assert(ctx.state)
+
+	-- Handler for updating connection settings
+	local function update_connection(new_uri)
+		ctx:update({
+			connection_uri = new_uri,
+			db_type = detect_db_type(new_uri),
+			queries = state.queries,
+			query_states = state.query_states,
+		})
+	end
+
+	-- Handler for updating query text
+	local function update_query(query_id, new_text, callback)
+		if callback then
+			-- Execute query
+			if not state.db_type then
+				callback(false, "Error: Invalid database URI")
+				return
+			end
+			on_execute(state.db_type, state.connection_uri, new_text, callback)
+		else
+			-- Just update the query text
+			local new_queries = vim.deepcopy(state.queries)
+			new_queries[query_id] = new_text
+			ctx:update({
+				connection_uri = state.connection_uri,
+				db_type = state.db_type,
+				queries = new_queries,
+				query_states = state.query_states,
+			})
+		end
+	end
+
+	-- Handler for adding a new query
+	local function add_query()
+		local new_queries = vim.deepcopy(state.queries)
+		local next_id = #vim.tbl_keys(state.queries) + 1
+		-- Default query based on database type
+		local default_query = "SELECT 1;"
+		if state.db_type == "sqlite" then
+			default_query = 'SELECT * FROM sqlite_master WHERE type="table";'
+		elseif state.db_type == "postgresql" then
+			default_query = "SELECT * FROM information_schema.tables LIMIT 10;"
+		elseif state.db_type == "redis" then
+			default_query = "KEYS *"
+		end
+		new_queries[next_id] = default_query
+		ctx:update({
+			connection_uri = state.connection_uri,
+			db_type = state.db_type,
+			queries = new_queries,
+			query_states = state.query_states,
+		})
+	end
+
+	return {
+		-- Main Title
+		h["@markup.heading"]({}, "# Database Notebook"),
+		"\n\n",
+		h.Comment({}, "> Interactive database query interface in markdown format"),
+		"\n",
+		h.Comment({}, "> Save this buffer to preserve your queries and results"),
+		"\n\n",
+
+		-- Section 1: Connection Settings
+		h.Title({}, "## Connection Settings"),
+		"\n\n",
+		h.Comment({}, "```bash"),
+		"\n",
+		h.Comment({}, "# Database connection URI"),
+		"\n",
+		h.Comment({}, "# Formats:"),
+		"\n",
+		h.Comment({}, "#   SQLite: sqlite://:memory: or sqlite:///path/to/database.db"),
+		"\n",
+		h.Comment({}, "#   PostgreSQL: postgresql://user:password@host:port/database"),
+		"\n",
+		h.Comment({}, "#   ClickHouse: clickhouse://user:password@host:port/database"),
+		"\n",
+		h.Comment({}, "#   Redis: redis://password@host:port/db"),
+		"\n",
+		h("text", {
+			id = "connection-uri",
+			on_change = function(e)
+				update_connection(e.text)
+			end,
+		}, state.connection_uri),
+		"\n",
+		h.Comment({}, "```"),
+		"\n\n",
+
+		-- Detected DB Type
+		h.Title({}, "Detected Database Type: "),
+		state.db_type and h.String({}, state.db_type) or h.ErrorMsg({}, "Unknown"),
+		"\n\n",
+
+		-- Section 2: Queries
+		h.Title({}, "## Queries"),
+		"\n",
+		h.Comment({}, "> Edit the SQL in the code blocks below"),
+		"\n",
+		h.Comment({}, "> Press <CR> on [Execute Query N] to run that query"),
+		"\n",
+
+		-- Render all query blocks
+		vim.tbl_map(function(query_id)
+			return h(QueryBlock, {
+				query_id = query_id,
+				query_text = state.queries[query_id],
+				on_execute = update_query,
+			})
+		end, vim.tbl_keys(state.queries)),
+
+		-- Add Query Button
+		"\n",
+		h.Keyword({
+			nmap = {
+				["<CR>"] = function()
+					add_query()
+					return ""
+				end,
+			},
+		}, "[+ Add New Query - Press <CR>]"),
+		"\n\n",
+
+		-- Section 3: Help
+		h.Title({}, "## Tips"),
+		"\n",
+		h.Comment({}, "- Edit connection URI in the bash code block"),
+		"\n",
+		h.Comment({}, "- Edit queries in the sql code blocks"),
+		"\n",
+		h.Comment({}, "- Press <CR> on [Execute Query N] to run a specific query"),
+		"\n",
+		h.Comment({}, "- Press <CR> on [+ Add New Query] to add more queries"),
+		"\n",
+		h.Comment({}, "- Save this buffer with :w to preserve your work"),
+		"\n",
+		h.Comment({}, "- Results appear in json code blocks below each query"),
+		"\n",
+		h.Comment({}, "- Supported: SQLite (default), PostgreSQL, ClickHouse, Redis"),
+		"\n",
+	}
+end
+
+--------------------------------------------------------------------------------
+-- Setup
+--------------------------------------------------------------------------------
+
+-- Setup function: Creates a single markdown buffer
+local function setup()
+	-- Create new buffer
+	vim.cmd.vnew()
+	local bufnr = vim.api.nvim_get_current_buf()
+	vim.bo[bufnr].bufhidden = "hide" -- Hide instead of delete (preserve content)
+	vim.bo[bufnr].buflisted = true -- Show in buffer list
+	vim.bo[bufnr].buftype = "" -- Normal buffer (can be saved)
+	vim.bo[bufnr].filetype = "markdown" -- Markdown syntax highlighting
+	vim.api.nvim_buf_set_name(bufnr, "database-notebook.md")
+
+	-- Mount the app
+	Morph.new(bufnr):mount(h(DatabaseNotebook, {}))
+
+	-- Set up buffer-local keymaps
+	vim.keymap.set("n", "q", "<cmd>quit<cr>", { buffer = bufnr, desc = "Close notebook" })
+	vim.keymap.set("n", "<leader>s", "<cmd>write<cr>", { buffer = bufnr, desc = "Save notebook to file" })
+end
+
+-- Launch the notebook
+setup()
+
+vim.notify(
+	"Database Notebook loaded! Edit the connection URI and queries, then press <CR> on [Execute].",
+	vim.log.levels.INFO
+)
