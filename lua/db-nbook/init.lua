@@ -29,6 +29,50 @@ local h = Morph.h
 local M = {}
 
 --------------------------------------------------------------------------------
+-- State Serialization
+--------------------------------------------------------------------------------
+
+-- Serialize state to JSON
+--- @param state table
+--- @return string
+local function serialize_state(state)
+	return vim.fn.json_encode({
+		connection_uri = state.connection_uri,
+		db_type = state.db_type,
+		queries = state.queries,
+	})
+end
+
+-- Deserialize state from JSON
+--- @param json_str string
+--- @return table|nil
+local function deserialize_state(json_str)
+	local ok, data = pcall(vim.fn.json_decode, json_str)
+	if not ok then
+		return nil
+	end
+	return {
+		connection_uri = data.connection_uri or "sqlite://:memory:",
+		db_type = data.db_type or detect_db_type(data.connection_uri or "sqlite://:memory:"),
+		queries = data.queries or { [1] = "SELECT 1;" },
+		query_states = {},
+	}
+end
+
+-- Load state from file
+--- @param filepath string
+--- @return table|nil
+local function load_state_from_file(filepath)
+	local file = io.open(filepath, "r")
+	if not file then
+		return nil
+	end
+	local content = file:read("*all")
+	file:close()
+	return deserialize_state(content)
+end
+
+--------------------------------------------------------------------------------
 -- Utility Functions
 --------------------------------------------------------------------------------
 
@@ -77,7 +121,7 @@ local function on_execute(db_type, uri, query, callback)
 
 		-- Use clickhouse-client command
 		cmd = string.format(
-			"clickhouse-client --host=%s --port=%s --user=%s --password=%s --database=%s --query=%s --format=JSONEachRow",
+			"TZ=UTC clickhouse client -s --host=%s --port=%s --user=%s --password=%s --database=%s --query=%s --format=JSONEachRow",
 			vim.fn.shellescape(host),
 			vim.fn.shellescape(port),
 			vim.fn.shellescape(user),
@@ -223,22 +267,65 @@ end
 -- Main App Component
 --------------------------------------------------------------------------------
 
---- @param ctx morph.Ctx<{}, { connection_uri: string, db_type: string|nil, queries: table<integer, string>, query_states: table<integer, any> }>
+--- @param ctx morph.Ctx<{ default_state: table?, filepath: string?, bufnr: number }, { connection_uri: string, db_type: string|nil, queries: table<integer, string>, query_states: table<integer, any> }>
 local function DatabaseNotebook(ctx)
 	if ctx.phase == "mount" then
-		ctx.state = {
-			connection_uri = "sqlite:///tmp/foo.db",
-			db_type = detect_db_type("sqlite://:memory:"),
-			queries = {
-				[1] = [[CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);
-INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');
-INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com');
-INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@example.com');]],
-				[2] = "SELECT * FROM users;",
-				[3] = "SELECT sqlite_version();",
-			},
-			query_states = {},
-		}
+		-- Use provided default_state or create default
+		if ctx.props.default_state then
+			ctx.state = ctx.props.default_state
+		else
+			ctx.state = {
+				connection_uri = "sqlite:///tmp/foo.db",
+				db_type = detect_db_type("sqlite:///tmp/foo.db"),
+				queries = {
+					[1] = [[SHOW TABLES;]],
+				},
+				query_states = {},
+			}
+		end
+
+		-- Set up autocmd to save state to JSON on :w
+		vim.api.nvim_create_autocmd("BufWritePost", {
+			buffer = ctx.props.bufnr,
+			callback = function()
+				-- Get the current state
+				local current_state = ctx.state
+				if not current_state then
+					vim.notify("No state to save", vim.log.levels.WARN, { title = "Database Notebook" })
+					return
+				end
+
+				-- Determine save path
+				local save_path = vim.b[ctx.props.bufnr].db_nbook_filepath
+				if not save_path then
+					-- Prompt for filename
+					save_path = vim.fn.input("Save state to: ", "database-notebook-state.json", "file")
+					if save_path == "" then
+						vim.notify("Save cancelled", vim.log.levels.INFO, { title = "Database Notebook" })
+						return
+					end
+				end
+
+				-- Serialize and save
+				local json_content = serialize_state(current_state)
+				local file = io.open(save_path, "w")
+				if not file then
+					vim.notify("Failed to open file for writing: " .. save_path, vim.log.levels.ERROR, {
+						title = "Database Notebook",
+					})
+					return
+				end
+
+				file:write(json_content)
+				file:close()
+
+				-- Store the filepath for future saves
+				vim.b[ctx.props.bufnr].db_nbook_filepath = save_path
+
+				vim.notify("State saved to: " .. save_path, vim.log.levels.INFO, { title = "Database Notebook" })
+			end,
+			desc = "Save database notebook state to JSON",
+		})
 	end
 
 	local state = assert(ctx.state)
@@ -386,28 +473,40 @@ INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@example.com');]],
 		"\n",
 	}
 end
-
 --------------------------------------------------------------------------------
 -- Setup
 --------------------------------------------------------------------------------
 
 -- Setup function: Creates a single markdown buffer
-M.db_nbook = function()
+M.db_nbook = function(filepath)
 	-- Create new buffer
-	vim.cmd.vnew()
+	local tmpfile = vim.fn.tempname()
+
+	vim.cmd.edit(tmpfile)
 	local bufnr = vim.api.nvim_get_current_buf()
-	vim.bo[bufnr].bufhidden = "hide" -- Hide instead of delete (preserve content)
-	vim.bo[bufnr].buflisted = true -- Show in buffer list
-	vim.bo[bufnr].buftype = "" -- Normal buffer (can be saved)
 	vim.bo[bufnr].filetype = "markdown" -- Markdown syntax highlighting
-	vim.api.nvim_buf_set_name(bufnr, "database-notebook.md")
 
-	-- Mount the app
-	Morph.new(bufnr):mount(h(DatabaseNotebook, {}))
+	-- Initialize state from file or use nil for default
+	local initial_state = nil
+	if filepath then
+		initial_state = load_state_from_file(filepath)
+		if initial_state then
+			vim.notify("Loaded state from: " .. filepath, vim.log.levels.INFO, { title = "Database Notebook" })
+		else
+			vim.notify("Failed to load state from: " .. filepath, vim.log.levels.WARN, { title = "Database Notebook" })
+			initial_state = nil -- Reset to nil so default state is used
+		end
+	end
 
-	-- Set up buffer-local keymaps
-	vim.keymap.set("n", "q", "<cmd>quit<cr>", { buffer = bufnr, desc = "Close notebook" })
-	vim.keymap.set("n", "<leader>s", "<cmd>write<cr>", { buffer = bufnr, desc = "Save notebook to file" })
+	-- Store filepath in buffer variable
+	vim.b[bufnr].db_nbook_filepath = filepath
+
+	-- Mount the app with props
+	Morph.new(bufnr):mount(h(DatabaseNotebook, {
+		default_state = initial_state,
+		filepath = filepath,
+		bufnr = bufnr,
+	}))
 
 	vim.notify(
 		"Database Notebook loaded! Edit the connection URI and queries, then press <CR> on [Execute].",
