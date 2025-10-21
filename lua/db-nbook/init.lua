@@ -23,8 +23,8 @@ Database URI formats:
 - PostgreSQL: postgresql://user:password@host:port/database
 - Redis: redis://password@host:port/db
 --]]
-
 local Morph = require("morph")
+local Sources = require("db-nbook.sources")
 local h = Morph.h
 local M = {}
 
@@ -36,16 +36,7 @@ local M = {}
 --- @param uri string
 --- @return 'sqlite'|'clickhouse'|'postgresql'|'redis'|nil
 local function detect_db_type(uri)
-	if uri:match("^sqlite://") then
-		return "sqlite"
-	elseif uri:match("^clickhouse://") then
-		return "clickhouse"
-	elseif uri:match("^postgres") then
-		return "postgresql"
-	elseif uri:match("^redis://") then
-		return "redis"
-	end
-	return nil
+	return Sources.detect(uri)
 end
 
 -- Serialize state to JSON
@@ -67,10 +58,12 @@ local function deserialize_state(json_str)
 	if not ok then
 		return nil
 	end
+	local connection_uri = data.connection_uri or "sqlite://:memory:"
+	local db_type = data.db_type or detect_db_type(connection_uri)
 	return {
-		connection_uri = data.connection_uri or "sqlite://:memory:",
-		db_type = data.db_type or detect_db_type(data.connection_uri or "sqlite://:memory:"),
-		queries = data.queries or { [1] = "SELECT 1;" },
+		connection_uri = connection_uri,
+		db_type = db_type,
+		queries = data.queries or { [1] = Sources.default_query(db_type) },
 		query_states = {},
 	}
 end
@@ -98,69 +91,15 @@ end
 --- @param query string
 --- @param callback fun(success: boolean, result: string)
 local function on_execute(db_type, uri, query, callback)
-	local cmd
-
-	if db_type == "sqlite" then
-		-- Parse SQLite URI: sqlite://path/to/db.db or sqlite://:memory:
-		local db_path = uri:match("sqlite://(.+)")
-		if not db_path then
-			callback(false, "Invalid SQLite URI format")
-			return
-		end
-
-		-- Use sqlite3 command with JSON output mode
-		-- -json: Output results as JSON array
-		cmd = string.format("sqlite3 -json %s %s", vim.fn.shellescape(db_path), vim.fn.shellescape(query))
-	elseif db_type == "clickhouse" then
-		-- Parse ClickHouse URI: clickhouse://user:password@host:port/database
-		local user, password, host, port, database = uri:match("clickhouse://([^:]+):([^@]+)@([^:]+):(%d+)/(.+)")
-		if not user then
-			callback(false, "Invalid ClickHouse URI format")
-			return
-		end
-
-		-- Use clickhouse-client command
-		cmd = string.format(
-			"TZ=UTC clickhouse client -s --host=%s --port=%s --user=%s --password=%s --database=%s --query=%s --format=JSONEachRow",
-			vim.fn.shellescape(host),
-			vim.fn.shellescape(port),
-			vim.fn.shellescape(user),
-			vim.fn.shellescape(password),
-			vim.fn.shellescape(database),
-			vim.fn.shellescape(query)
-		)
-	elseif db_type == "postgresql" then
-		-- Use psql command with connection string and JSON output
-		cmd = string.format("psql %s -c %s --tuples-only --json", vim.fn.shellescape(uri), vim.fn.shellescape(query))
-	elseif db_type == "redis" then
-		-- Parse Redis URI: redis://password@host:port/db
-		local password, host, port, db = uri:match("redis://([^@]+)@([^:]+):(%d+)/(%d+)")
-		if not password then
-			-- Try without password: redis://host:port/db
-			host, port, db = uri:match("redis://([^:]+):(%d+)/(%d+)")
-			if not host then
-				callback(false, "Invalid Redis URI format")
-				return
-			end
-			cmd = string.format(
-				"redis-cli -h %s -p %s -n %s %s",
-				vim.fn.shellescape(host),
-				vim.fn.shellescape(port),
-				vim.fn.shellescape(db),
-				vim.fn.shellescape(query)
-			)
-		else
-			cmd = string.format(
-				"redis-cli -h %s -p %s -a %s -n %s %s",
-				vim.fn.shellescape(host),
-				vim.fn.shellescape(port),
-				vim.fn.shellescape(password),
-				vim.fn.shellescape(db),
-				vim.fn.shellescape(query)
-			)
-		end
-	else
+	local source = Sources.get(db_type)
+	if not source then
 		callback(false, "Unsupported database type")
+		return
+	end
+
+	local cmd, err = source.build_command(uri, query)
+	if not cmd then
+		callback(false, err or "Failed to build execution command")
 		return
 	end
 
@@ -269,11 +208,13 @@ local function DatabaseNotebook(ctx)
 		if ctx.props.default_state then
 			ctx.state = ctx.props.default_state
 		else
+			local connection_uri = "sqlite:///tmp/foo.db"
+			local db_type = detect_db_type(connection_uri)
 			ctx.state = {
-				connection_uri = "sqlite:///tmp/foo.db",
-				db_type = detect_db_type("sqlite:///tmp/foo.db"),
+				connection_uri = connection_uri,
+				db_type = db_type,
 				queries = {
-					[1] = [[SHOW TABLES;]],
+					[1] = Sources.default_query(db_type),
 				},
 				query_states = {},
 			}
@@ -362,14 +303,7 @@ local function DatabaseNotebook(ctx)
 		local new_queries = vim.deepcopy(state.queries)
 		local next_id = #vim.tbl_keys(state.queries) + 1
 		-- Default query based on database type
-		local default_query = "SELECT 1;"
-		if state.db_type == "sqlite" then
-			default_query = 'SELECT * FROM sqlite_master WHERE type="table";'
-		elseif state.db_type == "postgresql" then
-			default_query = "SELECT * FROM information_schema.tables LIMIT 10;"
-		elseif state.db_type == "redis" then
-			default_query = "KEYS *"
-		end
+		local default_query = Sources.default_query(state.db_type)
 		new_queries[next_id] = default_query
 		ctx:update({
 			connection_uri = state.connection_uri,
