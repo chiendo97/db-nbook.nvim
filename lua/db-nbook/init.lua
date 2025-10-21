@@ -32,6 +32,22 @@ local M = {}
 -- State Serialization
 --------------------------------------------------------------------------------
 
+-- Utility function to parse database type from URI
+--- @param uri string
+--- @return 'sqlite'|'clickhouse'|'postgresql'|'redis'|nil
+local function detect_db_type(uri)
+	if uri:match("^sqlite://") then
+		return "sqlite"
+	elseif uri:match("^clickhouse://") then
+		return "clickhouse"
+	elseif uri:match("^postgres") then
+		return "postgresql"
+	elseif uri:match("^redis://") then
+		return "redis"
+	end
+	return nil
+end
+
 -- Serialize state to JSON
 --- @param state table
 --- @return string
@@ -75,22 +91,6 @@ end
 --------------------------------------------------------------------------------
 -- Utility Functions
 --------------------------------------------------------------------------------
-
--- Utility function to parse database type from URI
---- @param uri string
---- @return 'sqlite'|'clickhouse'|'postgresql'|'redis'|nil
-local function detect_db_type(uri)
-	if uri:match("^sqlite://") then
-		return "sqlite"
-	elseif uri:match("^clickhouse://") then
-		return "clickhouse"
-	elseif uri:match("^postgres") then
-		return "postgresql"
-	elseif uri:match("^redis://") then
-		return "redis"
-	end
-	return nil
-end
 
 -- Execute database query based on DB type
 --- @param db_type 'sqlite'|'clickhouse'|'postgresql'|'redis'
@@ -184,9 +184,6 @@ local function on_execute(db_type, uri, query, callback)
 				end
 			end
 		end,
-		on_exit = function(_, exit_code)
-			-- if exit_code ~= 0 then callback(false, 'Query failed with exit code: ' .. exit_code) end
-		end,
 	})
 end
 
@@ -195,7 +192,6 @@ end
 --------------------------------------------------------------------------------
 
 -- Represents a single executable query block
---- @param ctx morph.Ctx<{ query_id: integer, query_text: string, on_execute: function }, { status: 'idle'|'running'|'success'|'error', result: string }>
 local function QueryBlock(ctx)
 	if ctx.phase == "mount" then
 		ctx.state = {
@@ -267,7 +263,6 @@ end
 -- Main App Component
 --------------------------------------------------------------------------------
 
---- @param ctx morph.Ctx<{ default_state: table?, filepath: string?, bufnr: number }, { connection_uri: string, db_type: string|nil, queries: table<integer, string>, query_states: table<integer, any> }>
 local function DatabaseNotebook(ctx)
 	if ctx.phase == "mount" then
 		-- Use provided default_state or create default
