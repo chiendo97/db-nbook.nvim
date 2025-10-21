@@ -26,6 +26,7 @@ Database URI formats:
 
 local Morph = require("morph")
 local h = Morph.h
+local M = {}
 
 --------------------------------------------------------------------------------
 -- Utility Functions
@@ -391,7 +392,7 @@ end
 --------------------------------------------------------------------------------
 
 -- Setup function: Creates a single markdown buffer
-local function setup()
+M.db_nbook = function()
 	-- Create new buffer
 	vim.cmd.vnew()
 	local bufnr = vim.api.nvim_get_current_buf()
@@ -407,12 +408,11 @@ local function setup()
 	-- Set up buffer-local keymaps
 	vim.keymap.set("n", "q", "<cmd>quit<cr>", { buffer = bufnr, desc = "Close notebook" })
 	vim.keymap.set("n", "<leader>s", "<cmd>write<cr>", { buffer = bufnr, desc = "Save notebook to file" })
+
+	vim.notify(
+		"Database Notebook loaded! Edit the connection URI and queries, then press <CR> on [Execute].",
+		vim.log.levels.INFO
+	)
 end
 
--- Launch the notebook
-setup()
-
-vim.notify(
-	"Database Notebook loaded! Edit the connection URI and queries, then press <CR> on [Execute].",
-	vim.log.levels.INFO
-)
+return M
