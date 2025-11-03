@@ -8,7 +8,7 @@ function M.matches(uri)
 end
 
 function M.build_command(uri, query)
-	local cmd = string.format("psql %s -c %s", vim.fn.shellescape(uri), vim.fn.shellescape(query))
+	local cmd = string.format("usql %s -c %s", vim.fn.shellescape(uri), vim.fn.shellescape(query))
 	return cmd
 end
 

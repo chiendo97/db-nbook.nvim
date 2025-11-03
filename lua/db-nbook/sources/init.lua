@@ -1,4 +1,4 @@
----@alias db_nbook.SourceName "sqlite"|"clickhouse"|"postgresql"|"redis"
+---@alias db_nbook.SourceName "sqlite"|"clickhouse"|"postgresql"|"redis"|"mysql"
 
 ---@class db_nbook.Source
 ---@field name db_nbook.SourceName
@@ -11,6 +11,7 @@ local sources = {
 	require("db-nbook.sources.clickhouse"),
 	require("db-nbook.sources.postgresql"),
 	require("db-nbook.sources.redis"),
+	require("db-nbook.sources.mysql"),
 }
 
 ---@type table<db_nbook.SourceName, db_nbook.Source>

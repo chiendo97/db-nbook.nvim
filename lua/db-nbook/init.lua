@@ -21,6 +21,7 @@ Database URI formats:
 - SQLite: sqlite://path/to/database.db or sqlite://:memory:
 - ClickHouse: clickhouse://user:password@host:port/database
 - PostgreSQL: postgresql://user:password@host:port/database
+- MySQL: mysql://user:password@host:port/database
 - Redis: redis://password@host:port/db
 --]]
 local Morph = require("morph")
@@ -34,7 +35,7 @@ local M = {}
 
 -- Utility function to parse database type from URI
 --- @param uri string
---- @return 'sqlite'|'clickhouse'|'postgresql'|'redis'|nil
+--- @return 'sqlite'|'clickhouse'|'postgresql'|'redis'|'mysql'|nil
 local function detect_db_type(uri)
 	return Sources.detect(uri)
 end
@@ -86,7 +87,7 @@ end
 --------------------------------------------------------------------------------
 
 -- Execute database query based on DB type
---- @param db_type 'sqlite'|'clickhouse'|'postgresql'|'redis'
+--- @param db_type 'sqlite'|'clickhouse'|'postgresql'|'redis'|'mysql'
 --- @param uri string
 --- @param query string
 --- @param callback fun(success: boolean, result: string)
@@ -97,7 +98,10 @@ local function on_execute(db_type, uri, query, callback)
 		return
 	end
 
-	local cmd, err = source.build_command(uri, query)
+	local normalized_uri = uri:match("^%s*(.-)%s*$")
+	local normalized_query = query:match("^%s*(.-)%s*$")
+
+	local cmd, err = source.build_command(normalized_uri, normalized_query)
 	if not cmd then
 		callback(false, err or "Failed to build execution command")
 		return
@@ -187,7 +191,7 @@ local function QueryBlock(ctx)
 				and {
 					h.Title({}, "Results:"),
 					"\n\n",
-					h("text", {}, "```json"),
+					h("text", {}, "```"),
 					"\n",
 					h("text", {}, state.result),
 					"\n",
@@ -337,6 +341,8 @@ local function DatabaseNotebook(ctx)
 		"\n",
 		h.Comment({}, "#   ClickHouse: clickhouse://user:password@host:port/database"),
 		"\n",
+		h.Comment({}, "#   MySQL: mysql://user:password@host:port/database"),
+		"\n",
 		h.Comment({}, "#   Redis: redis://password@host:port/db"),
 		"\n",
 		h("text", {
@@ -398,7 +404,7 @@ local function DatabaseNotebook(ctx)
 		"\n",
 		h.Comment({}, "- Results appear in json code blocks below each query"),
 		"\n",
-		h.Comment({}, "- Supported: SQLite (default), PostgreSQL, ClickHouse, Redis"),
+		h.Comment({}, "- Supported: SQLite (default), PostgreSQL, ClickHouse, MySQL, Redis"),
 		"\n",
 	}
 end
